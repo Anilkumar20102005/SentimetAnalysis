@@ -1,0 +1,14 @@
+{
+  "model_type": "TF-IDF + Logistic Regression Pipeline",
+  "dataset": "CyranoB/polarity (Amazon Review Polarity)",
+  "train_samples": 21250,
+  "test_samples": 5000,
+  "tfidf_max_features": 80000,
+  "ngram_range": "(1,2)",
+  "test_accuracy": 0.8694,
+  "test_roc_auc": 0.9451,
+  "classes": {
+    "0": "negative",
+    "1": "positive"
+  }
+}
