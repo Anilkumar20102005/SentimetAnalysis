@@ -1,3 +1,5 @@
+<a href="https://deepwiki.com/Anilkumar20102005/SentimetAnalysis"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
+
 # 🛍️ Product Sentiment Analysis — Full Stack AI Platform
 
 > An end-to-end, production-ready AI application for real-time product review sentiment classification, powered by a frozen **TF-IDF + Logistic Regression** pipeline trained on the **Amazon Review Polarity** dataset, an asynchronous **FastAPI** backend, and a modern, glassmorphic **React** frontend.
