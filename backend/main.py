@@ -22,9 +22,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 # ─── NLTK Setup ─────────────────────────────────────────────────────────────
+nltk.data.path.insert(0, str(Path(__file__).parent / "nltk_data"))
 nltk.download("stopwords", quiet=True)
 nltk.download("wordnet",   quiet=True)
-nltk.download("omw-1.4",   quiet=True)
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 
