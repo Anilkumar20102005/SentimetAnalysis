@@ -47,32 +47,83 @@ lemmatizer = WordNetLemmatizer()
 
 
 def preprocess(text: str) -> str:
-    """Mirror of notebook preprocessing — must stay identical."""
+    """Mirror of notebook preprocessing with robust fallback for short reviews."""
     if not isinstance(text, str):
         return ""
     text = text.lower()
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"http\S+", "", text)
     text = re.sub(r"[^a-z\s]", " ", text)
-    tokens = [lemmatizer.lemmatize(w) for w in text.split()
+    words = text.split()
+    tokens = [lemmatizer.lemmatize(w) for w in words
               if w not in STOP_WORDS and len(w) > 2]
+    # Fallback if standard filtering leaves nothing (e.g., short reviews like "ok", "so so")
+    if not tokens and words:
+        tokens = [lemmatizer.lemmatize(w) for w in words if len(w) >= 2]
     return " ".join(tokens)
+
+
+def extract_influential_words(pipeline, text: str, top_n: int = 8) -> list[dict]:
+    """Extract top influential positive and negative words from the model's coefficients."""
+    if pipeline is None:
+        return []
+    try:
+        tfidf = pipeline.named_steps.get("tfidf")
+        clf = pipeline.named_steps.get("clf")
+        if tfidf is None or clf is None:
+            return []
+        
+        coef = clf.coef_[0]
+        words = set(re.findall(r"[a-z]+", text.lower()))
+        scored = []
+        for w in words:
+            lemmatized = lemmatizer.lemmatize(w)
+            target = lemmatized if lemmatized in tfidf.vocabulary_ else (w if w in tfidf.vocabulary_ else None)
+            if target:
+                idx = tfidf.vocabulary_[target]
+                weight = float(coef[idx])
+                if abs(weight) >= 0.1:
+                    scored.append({
+                        "word": w,
+                        "weight": round(weight, 3),
+                        "sentiment": "positive" if weight > 0 else "negative"
+                    })
+        scored.sort(key=lambda x: abs(x["weight"]), reverse=True)
+        return scored[:top_n]
+    except Exception as err:
+        logger.warning(f"Keyword extraction failed: {err}")
+        return []
+
+
+def get_pipeline():
+    """Get the loaded pipeline, loading on-demand if not already in state."""
+    if model_state.get("pipeline") is None and MODEL_PATH.exists():
+        logger.info(f"Loading pipeline from {MODEL_PATH} on-demand...")
+        model_state["pipeline"] = joblib.load(MODEL_PATH)
+        if META_PATH.exists() and not model_state.get("metadata"):
+            with open(META_PATH) as f:
+                model_state["metadata"] = json.load(f)
+    return model_state.get("pipeline")
+
+
+def get_metadata() -> dict:
+    """Get metadata dictionary, loading on-demand if needed."""
+    if not model_state.get("metadata") and META_PATH.exists():
+        with open(META_PATH) as f:
+            model_state["metadata"] = json.load(f)
+    return model_state.get("metadata", {})
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: load model
     logger.info("Loading sentiment model...")
-    if not MODEL_PATH.exists():
-        logger.error(f"Model not found at {MODEL_PATH}. Run the notebook first!")
-        model_state["pipeline"] = None
-        model_state["metadata"] = {}
-    else:
-        model_state["pipeline"] = joblib.load(MODEL_PATH)
-        if META_PATH.exists():
-            with open(META_PATH) as f:
-                model_state["metadata"] = json.load(f)
+    get_pipeline()
+    get_metadata()
+    if model_state.get("pipeline") is not None:
         logger.info("Model loaded successfully.")
+    else:
+        logger.error(f"Model not found at {MODEL_PATH}. Run the notebook first!")
     yield
     model_state.clear()
 
@@ -96,12 +147,18 @@ app.add_middleware(
 
 # ─── Schemas ─────────────────────────────────────────────────────────────────
 class ReviewRequest(BaseModel):
-    text: str = Field(..., min_length=3, max_length=5000, description="Review text to analyze")
+    text: str = Field(..., min_length=2, max_length=5000, description="Review text to analyze")
     title: Optional[str] = Field(None, max_length=500, description="Optional review title")
 
     model_config = {"json_schema_extra": {
         "example": {"title": "Great product!", "text": "Absolutely loved it. Works perfectly and arrived fast!"}
     }}
+
+
+class KeywordInfluence(BaseModel):
+    word: str
+    weight: float
+    sentiment: str  # "positive" or "negative"
 
 
 class SentimentResult(BaseModel):
@@ -111,6 +168,7 @@ class SentimentResult(BaseModel):
     negative_prob: float
     processed_text: str
     inference_ms: float
+    keywords: list[KeywordInfluence] = []
 
 
 class BatchRequest(BaseModel):
@@ -131,38 +189,42 @@ api_router = APIRouter()
 
 @api_router.get("/health", tags=["Health"])
 async def health():
-    return {"status": "ok", "model_loaded": model_state.get("pipeline") is not None}
+    pipeline = get_pipeline()
+    return {"status": "ok", "model_loaded": pipeline is not None}
 
 
 @api_router.get("/model/info", response_model=ModelInfoResponse, tags=["Model"])
 async def model_info():
-    meta = model_state.get("metadata", {})
+    pipeline = get_pipeline()
+    meta = get_metadata()
     return ModelInfoResponse(
         model_type=meta.get("model_type", "Unknown"),
         dataset=meta.get("dataset", "Unknown"),
         test_accuracy=meta.get("test_accuracy"),
         test_roc_auc=meta.get("test_roc_auc"),
         train_samples=meta.get("train_samples"),
-        model_loaded=model_state.get("pipeline") is not None,
+        model_loaded=pipeline is not None,
     )
 
 
 @api_router.post("/predict", response_model=SentimentResult, tags=["Prediction"])
 async def predict(req: ReviewRequest):
-    pipeline = model_state.get("pipeline")
+    pipeline = get_pipeline()
     if pipeline is None:
-        raise HTTPException(status_code=503, detail="Model not loaded. Run the notebook first!")
+        raise HTTPException(status_code=503, detail="Model not loaded. Please train or load model first!")
 
     combined = (req.title or "") + " " + req.text
     cleaned  = preprocess(combined)
 
     if not cleaned.strip():
-        raise HTTPException(status_code=422, detail="Text is empty after preprocessing.")
+        raise HTTPException(status_code=422, detail="Text must contain at least one readable word or token.")
 
     t0    = time.perf_counter()
     proba = pipeline.predict_proba([cleaned])[0]
     pred  = int(np.argmax(proba))
     elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    keywords = extract_influential_words(pipeline, combined, top_n=8)
 
     return SentimentResult(
         sentiment="positive" if pred == 1 else "negative",
@@ -171,16 +233,21 @@ async def predict(req: ReviewRequest):
         negative_prob=round(float(proba[0]), 4),
         processed_text=cleaned[:300],
         inference_ms=round(elapsed_ms, 2),
+        keywords=keywords,
     )
 
 
 @api_router.post("/predict/batch", tags=["Prediction"])
 async def predict_batch(req: BatchRequest):
-    pipeline = model_state.get("pipeline")
+    pipeline = get_pipeline()
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Model not loaded.")
 
     results = []
+    pos_count = 0
+    neg_count = 0
+    total_conf = 0.0
+
     for review in req.reviews:
         combined = (review.title or "") + " " + review.text
         cleaned  = preprocess(combined)
@@ -191,15 +258,41 @@ async def predict_batch(req: BatchRequest):
         proba = pipeline.predict_proba([cleaned])[0]
         pred  = int(np.argmax(proba))
         elapsed_ms = (time.perf_counter() - t0) * 1000
+        sentiment = "positive" if pred == 1 else "negative"
+        conf = round(float(max(proba)), 4)
+        
+        if sentiment == "positive":
+            pos_count += 1
+        else:
+            neg_count += 1
+        total_conf += conf
+
+        keywords = extract_influential_words(pipeline, combined, top_n=5)
         results.append({
-            "sentiment": "positive" if pred == 1 else "negative",
-            "confidence": round(float(max(proba)), 4),
+            "title": review.title or "",
+            "text": review.text,
+            "sentiment": sentiment,
+            "confidence": conf,
             "positive_prob": round(float(proba[1]), 4),
             "negative_prob": round(float(proba[0]), 4),
             "inference_ms": round(elapsed_ms, 2),
             "text_preview": review.text[:80],
+            "keywords": keywords,
         })
-    return {"count": len(results), "results": results}
+    valid_count = len(results)
+    avg_conf = round(total_conf / valid_count, 4) if valid_count > 0 else 0.0
+    return {
+        "count": valid_count,
+        "summary": {
+            "total": valid_count,
+            "positive": pos_count,
+            "negative": neg_count,
+            "positive_pct": round((pos_count / valid_count) * 100, 1) if valid_count > 0 else 0,
+            "negative_pct": round((neg_count / valid_count) * 100, 1) if valid_count > 0 else 0,
+            "avg_confidence": avg_conf,
+        },
+        "results": results
+    }
 
 
 @api_router.get("/examples", tags=["Prediction"])

@@ -100,6 +100,7 @@ def main():
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        shell=(sys.platform == "win32"),
     )
 
     # Stream logs asynchronously
